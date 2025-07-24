@@ -4,6 +4,12 @@
  */
 (function (global, factory) {
     typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports) :
+    typeof define === 'function' && define(/*! CloudBase JS SDK v1.5.0
+ * Copyright (c) 2018-present Tencent Cloud, Inc.
+ * Licensed under the MIT License
+ */
+(function (global, factory) {
+    typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports) :
     typeof define === 'function' && define.amd ? define(['exports'], factory) :
     (global = global || self, factory(global.tcb = {}));
 }(this, (function (exports) { 'use strict';
