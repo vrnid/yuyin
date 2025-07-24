@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>简易语音聊天</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        console.log("脚本开始解析。"); // ✅ 新增：确认脚本是否开始解析
+
+        // ✅ 腾讯云云开发 SDK 导入
+        import tcb from 'https://cdn.jsdelivr.net/npm/tcb-js-sdk/dist/tcb.js';
+
+        // Global variables for Tencent CloudBase and WebRTC
+        let tcbApp; // 腾讯云云开发应用实例
+        let db; // 腾讯云云开发数据库实例
+        let userId; // 用户ID
+        let localStream;
+        let remoteStream;
+        let peerConnection;
+        let roomRef; // 房间文档引用
+        let offerCandidatesRef; // Offer 候选者集合引用
+        let answerCandidatesRef; // Answer 候选者集合引用
+        let isAuthReady = false; // 认证状态
+
+        // 腾讯云云开发配置 (请替换为您的环境 ID)
+        const cloudBaseConfig = {
+            env: 'yuyin-1g0c0j8ge83983b7' // <-- ***请在这里替换为您的腾讯云云开发环境 ID***
+        };
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'; // 保持原有的 appId
+
+        try {
+            // ✅ 初始化腾讯云云开发
+            tcbApp = tcb.init(cloudBaseConfig);
+            db = tcbApp.database();
+            console.log("腾讯云云开发 SDK 初始化成功。"); // ✅ 新增：确认 SDK 初始化
+        } catch (e) {
+            console.error("腾讯云云开发 SDK 初始化失败:", e); // ✅ 新增：捕获初始化错误
+            displayMessage('腾讯云SDK初始化失败，请检查环境ID。', 'error');
+        }
+
+
+        // ✅ 腾讯云云开发匿名认证
+        async function authenticateCloudBase() {
+            console.log("正在尝试腾讯云云开发认证...");
+            if (!tcbApp) { // ✅ 新增：检查 tcbApp 是否已初始化
+                console.error("authenticateCloudBase: tcbApp 未初始化，无法进行认证。");
+                displayMessage('认证失败：腾讯云SDK未初始化。', 'error');
+                joinRoomButton.disabled = true;
+                return;
+            }
+            try {
+                const authResult = await tcbApp.auth().anonymousAuthProvider().signIn();
+                userId = authResult.uid; // 获取匿名用户的唯一ID
+                document.getElementById('user-id-display').textContent = `用户ID: ${userId}`;
+                isAuthReady = true;
+                joinRoomButton.disabled = false; // ✅ 认证成功后启用加入房间按钮
+                displayMessage('腾讯云认证成功，现在可以输入房间密钥并加入。', 'success');
+                console.log("腾讯云云开发认证成功。用户 ID:", userId);
+            } catch (e) {
+                console.error("腾讯云云开发认证失败:", e);
+                displayMessage('腾讯云认证失败，请检查环境ID、登录授权配置和网络连接。', 'error');
+                joinRoomButton.disabled = true; // ✅ 认证失败后禁用加入房间按钮
+                console.log("腾讯云云开发认证失败，加入房间按钮已禁用。");
+            }
+        }
+
+        // UI Elements
+        const roomKeyInput = document.getElementById('room-key-input');
+        const joinRoomButton = document.getElementById('join-room-button');
+        const leaveRoomButton = document.getElementById('leave-room-button');
+        const statusMessage = document.getElementById('status-message');
+        const localAudio = document.getElementById('local-audio');
+        const remoteAudio = document.getElementById('remote-audio');
+        const roomIdDisplay = document.getElementById('room-id-display');
+
+        // WebRTC Configuration
+        const servers = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' },
+            ]
+        };
+
+        /**
+         * Displays a message to the user.
+         * @param {string} message - The message to display.
+         * @param {string} type - The type of message (e.g., 'info', 'error', 'success').
+         */
+        function displayMessage(message, type = 'info') {
+            statusMessage.textContent = message;
+            statusMessage.className = `mt-4 p-3 rounded-md text-center ${
+                type === 'error' ? 'bg-red-100 text-red-700' :
+                type === 'success' ? 'bg-green-100 text-green-700' :
+                'bg-blue-100 text-blue-700'
+            }`;
+            console.log(`Message (${type}): ${message}`);
+        }
+
+        /**
+         * Gets local audio stream.
+         * @returns {Promise<MediaStream>} - The local media stream.
+         */
+        async function getLocalStream() {
+            console.log("正在尝试获取本地音频流...");
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                localAudio.srcObject = localStream;
+                displayMessage('已获取本地音频流。', 'success');
+                console.log("本地音频流获取成功。");
+                return localStream;
+            } catch (e) {
+                console.error('获取本地音频流失败:', e);
+                displayMessage('无法获取麦克风权限。请检查您的设备设置或浏览器权限。', 'error');
+                throw e;
+            }
+        }
+
+        /**
+         * Creates a new RTCPeerConnection and sets up event listeners.
+         * @param {string} roomId - The ID of the room.
+         * @param {boolean} isCaller - True if this peer is initiating the call (creating the offer).
+         */
+        async function createPeerConnection(roomId, isCaller) {
+            console.log("正在创建 PeerConnection...");
+            peerConnection = new RTCPeerConnection(servers);
+
+            // Add local stream tracks to peer connection
+            localStream.getTracks().forEach(track => {
+                peerConnection.addTrack(track, localStream);
+            });
+
+            // Handle remote stream
+            peerConnection.ontrack = (event) => {
+                if (event.streams && event.streams[0]) {
+                    remoteStream = event.streams[0];
+                    remoteAudio.srcObject = remoteStream;
+                    displayMessage('已接收到远程音频流。', 'success');
+                    console.log("已接收到远程音频流。");
+                }
+            };
+
+            // Handle ICE candidates
+            peerConnection.onicecandidate = async (event) => {
+                if (event.candidate) {
+                    const candidateData = event.candidate.toJSON();
+                    if (isCaller) {
+                        await offerCandidatesRef.add(candidateData);
+                        console.log("发送 Offer ICE Candidate:", candidateData);
+                    } else {
+                        await answerCandidatesRef.add(candidateData);
+                        console.log("发送 Answer ICE Candidate:", candidateData);
+                    }
+                }
+            };
+
+            peerConnection.oniceconnectionstatechange = () => {
+                console.log('ICE connection state:', peerConnection.iceConnectionState);
+                if (peerConnection.iceConnectionState === 'disconnected' || peerConnection.iceConnectionState === 'failed') {
+                    displayMessage('语音连接已断开。', 'error');
+                    leaveRoom(); // Automatically leave if connection fails
+                } else if (peerConnection.iceConnectionState === 'connected') {
+                    displayMessage('语音连接已建立。', 'success');
+                }
+            };
+
+            peerConnection.onconnectionstatechange = () => {
+                console.log('Peer connection state:', peerConnection.connectionState);
+                if (peerConnection.connectionState === 'disconnected' || peerConnection.connectionState === 'failed') {
+                    displayMessage('语音连接已断开。', 'error');
+                    leaveRoom(); // Automatically leave if connection fails
+                } else if (peerConnection.connectionState === 'connected') {
+                    displayMessage('语音连接已建立。', 'success');
+                }
+            };
+        }
+
+        /**
+         * Joins or creates a room.
+         */
+        async function joinRoom() {
+            console.log("进入 joinRoom 函数。");
+            if (!isAuthReady) {
+                displayMessage('认证未就绪，请稍候再试。', 'error'); // 更明确的提示
+                console.warn("joinRoom: 认证未就绪，函数提前退出。");
+                return;
+            }
+
+            const roomKey = roomKeyInput.value.trim();
+            if (!roomKey) {
+                displayMessage('请输入房间密钥。', 'error');
+                console.warn("房间密钥为空。");
+                return;
+            }
+
+            displayMessage('正在尝试加入房间...');
+            joinRoomButton.disabled = true;
+            leaveRoomButton.disabled = false;
+
+            try {
+                await getLocalStream(); // Ensure we have audio before proceeding
+                console.log("已获取本地流，继续加入房间逻辑。");
+
+                const cloudBasePath = `artifacts/${appId}/public/data`;
+                roomRef = db.collection(`${cloudBasePath}/rooms`).doc(roomKey);
+                offerCandidatesRef = db.collection(`${cloudBasePath}/rooms/${roomKey}/offerCandidates`);
+                answerCandidatesRef = db.collection(`${cloudBasePath}/rooms/${roomKey}/answerCandidates`);
+
+                console.log(`正在查询房间: ${roomKey}`);
+                const roomQueryResult = await roomRef.get();
+                const roomSnapshot = roomQueryResult.data;
+
+                if (roomSnapshot) {
+                    console.log(`房间 ${roomKey} 已存在，作为被呼叫方加入。`);
+                    await createPeerConnection(roomKey, false);
+                    const offer = roomSnapshot.offer;
+                    console.log("设置远程 Offer 描述符。");
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+                    console.log("创建 Answer。");
+                    const answer = await peerConnection.createAnswer();
+                    console.log("设置本地 Answer 描述符。");
+                    await peerConnection.setLocalDescription(answer);
+                    console.log("更新房间 Answer 到数据库。");
+                    await roomRef.set({ answer: answer.toJSON() });
+                    displayMessage(`已加入房间: ${roomKey}`, 'success');
+                    roomIdDisplay.textContent = `当前房间: ${roomKey}`;
+
+                    console.log("监听 Offer ICE Candidates...");
+                    offerCandidatesRef.watch({
+                        onChange: (snapshot) => {
+                            snapshot.docChanges.forEach(async (change) => {
+                                if (change.type === 'add') {
+                                    console.log("收到 Offer ICE Candidate:", change.doc.data);
+                                    const candidate = new RTCIceCandidate(change.doc.data);
+                                    await peerConnection.addIceCandidate(candidate);
+                                }
+                            });
+                        },
+                        onError: (err) => {
+                            console.error("监听 offerCandidates 失败:", err);
+                        }
+                    });
+
+                } else {
+                    console.log(`房间 ${roomKey} 不存在，作为呼叫方创建。`);
+                    await createPeerConnection(roomKey, true);
+                    console.log("创建 Offer。");
+                    const offer = await peerConnection.createOffer();
+                    await peerConnection.setLocalDescription(offer);
+                    console.log("将 Offer 写入数据库。");
+                    await roomRef.set({ offer: offer.toJSON() });
+                    displayMessage(`已创建并加入房间: ${roomKey}`, 'success');
+                    roomIdDisplay.textContent = `当前房间: ${roomKey}`;
+
+                    console.log("监听房间 Answer...");
+                    roomRef.watch({
+                        onChange: (snapshot) => {
+                            if (snapshot.docChanges && snapshot.docChanges.length > 0) {
+                                const data = snapshot.docChanges[0].doc.data;
+                                if (data && data.answer && !peerConnection.currentRemoteDescription) {
+                                    console.log("收到远程 Answer 描述符，正在设置。");
+                                    peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+                                }
+                            }
+                        },
+                        onError: (err) => {
+                            console.error("监听房间数据失败:", err);
+                        }
+                    });
+
+                    console.log("监听 Answer ICE Candidates...");
+                    answerCandidatesRef.watch({
+                        onChange: (snapshot) => {
+                            snapshot.docChanges.forEach(async (change) => {
+                                if (change.type === 'add') {
+                                    console.log("收到 Answer ICE Candidate:", change.doc.data);
+                                    const candidate = new RTCIceCandidate(change.doc.data);
+                                    await peerConnection.addIceCandidate(candidate);
+                                }
+                            });
+                        },
+                        onError: (err) => {
+                            console.error("监听 answerCandidates 失败:", err);
+                        }
+                    });
+                }
+            } catch (e) {
+                console.error('加入房间失败:', e);
+                displayMessage(`加入房间失败: ${e.message}。请检查麦克风权限和腾讯云配置。`, 'error');
+                joinRoomButton.disabled = false;
+                leaveRoomButton.disabled = true;
+                // Clean up if an error occurs during joining
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                    localAudio.srcObject = null;
+                    localStream = null;
+                }
+                if (peerConnection) {
+                    peerConnection.close();
+                    peerConnection = null;
+                }
+            }
+        }
+
+        /**
+         * Leaves the current room and cleans up resources.
+         */
+        async function leaveRoom() {
+            displayMessage('正在离开房间...');
+            joinRoomButton.disabled = false;
+            leaveRoomButton.disabled = true;
+
+            // Stop local audio tracks
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localAudio.srcObject = null;
+                localStream = null;
+                console.log("本地音频流已停止。");
+            }
+
+            // Stop remote audio tracks
+            if (remoteStream) {
+                remoteStream.getTracks().forEach(track => track.stop());
+                remoteAudio.srcObject = null;
+                remoteStream = null;
+                console.log("远程音频流已停止。");
+            }
+
+            // Close peer connection
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+                console.log("PeerConnection 已关闭。");
+            }
+
+            // Clean up CloudBase data
+            if (roomRef) {
+                try {
+                    console.log("正在清理腾讯云云开发数据...");
+                    // 删除 offerCandidates 集合中的文档
+                    const offerCandidatesResult = await offerCandidatesRef.get();
+                    if (offerCandidatesResult.data) {
+                        for (const doc of offerCandidatesResult.data) {
+                            await offerCandidatesRef.doc(doc._id).remove();
+                            console.log("删除 Offer Candidate:", doc._id);
+                        }
+                    }
+
+                    // 删除 answerCandidates 集合中的文档
+                    const answerCandidatesResult = await answerCandidatesRef.get();
+                    if (answerCandidatesResult.data) {
+                        for (const doc of answerCandidatesResult.data) {
+                            await answerCandidatesRef.doc(doc._id).remove();
+                            console.log("删除 Answer Candidate:", doc._id);
+                        }
+                    }
+
+                    // 删除房间文档
+                    const roomQueryResult = await roomRef.get();
+                    if (roomQueryResult.data) { // 检查数据是否存在
+                         await roomRef.remove();
+                         console.log(`房间 ${roomKeyInput.value.trim()} 已从腾讯云云开发数据库删除。`);
+                    }
+                } catch (e) {
+                    console.error('清理腾讯云云开发数据失败:', e);
+                    displayMessage('清理房间数据失败。', 'error');
+                }
+            }
+
+            roomRef = null;
+            offerCandidatesRef = null;
+            answerCandidatesRef = null;
+
+            roomKeyInput.value = '';
+            roomIdDisplay.textContent = '当前房间: 无';
+            displayMessage('已成功离开房间。', 'info');
+        }
+
+        // Event Listeners
+        joinRoomButton.addEventListener('click', () => {
+            console.log("点击了 '加入房间' 按钮。");
+            joinRoom();
+        });
+        leaveRoomButton.addEventListener('click', leaveRoom);
+
+        // Initial UI state
+        window.onload = async () => {
+            console.log("window.onload 事件触发。"); // ✅ 新增：确认 onload 触发
+            roomKeyInput.value = '';
+            joinRoomButton.disabled = true; // 初始禁用加入房间按钮
+            leaveRoomButton.disabled = true;
+            roomIdDisplay.textContent = '当前房间: 无';
+            displayMessage('正在初始化和认证，请稍候...', 'info');
+            console.log("页面加载完成，开始认证流程。");
+            await authenticateCloudBase(); // 在这里调用认证函数
+            // authenticateCloudBase 成功后会启用 joinRoomButton
+            console.log("认证流程结束。isAuthReady:", isAuthReady);
+        };
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f0f2f5;
+        }
+    </style>
+</head>
+<body class="flex items-center justify-center min-h-screen bg-gray-100 p-4">
+    <div class="bg-white p-8 rounded-xl shadow-lg w-full max-w-md border border-gray-200">
+        <h1 class="text-3xl font-bold text-center text-gray-800 mb-6">简易语音聊天</h1>
+
+        <div class="mb-6">
+            <label for="room-key-input" class="block text-gray-700 text-sm font-semibold mb-2">房间密钥</label>
+            <input type="text" id="room-key-input" placeholder="输入房间密钥"
+                   class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition duration-200 ease-in-out">
+        </div>
+
+        <div class="flex flex-col space-y-3 mb-6">
+            <button id="join-room-button"
+                    class="w-full bg-blue-600 text-white py-3 px-6 rounded-lg font-semibold hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition duration-200 ease-in-out shadow-md">
+                加入房间
+            </button>
+            <button id="leave-room-button"
+                    class="w-full bg-red-500 text-white py-3 px-6 rounded-lg font-semibold hover:bg-red-600 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 transition duration-200 ease-in-out shadow-md">
+                离开房间
+            </button>
+        </div>
+
+        <p id="status-message" class="mt-4 p-3 rounded-md text-center bg-blue-100 text-blue-700 text-sm"></p>
+        <p id="room-id-display" class="mt-2 text-gray-600 text-center text-sm">当前房间: 无</p>
+        <p id="user-id-display" class="mt-2 text-gray-600 text-center text-xs break-all"></p>
+
+        <div class="mt-6 flex flex-col items-center">
+            <h2 class="text-lg font-semibold text-gray-700 mb-2">您的音频</h2>
+            <audio id="local-audio" autoplay muted class="w-full max-w-xs rounded-lg shadow-sm"></audio>
+        </div>
+
+        <div class="mt-4 flex flex-col items-center">
+            <h2 class="text-lg font-semibold text-gray-700 mb-2">远程音频</h2>
+            <audio id="remote-audio" autoplay class="w-full max-w-xs rounded-lg shadow-sm"></audio>
+        </div>
+    </div>
+</body>
+</html>
